@@ -1,0 +1,55 @@
+# ------------------------------------------------------------------
+# Flood Risk Prediction — pipeline configuration
+# ------------------------------------------------------------------
+
+data:
+  source: "open_meteo"            # "open_meteo" (real API data) or "synthetic" (offline simulated data)
+  random_state: 42                # seed for synthetic data generation
+  raw_path: data/raw/flood_data.csv              # cached raw daily data (one row per location per day)
+  processed_path: data/processed/flood_processed.csv  # features + labels after processing
+
+  # Shared period for both sources
+  start_date: "2020-01-01"
+  end_date: "2024-12-31"
+
+  # Locations to model. Each GloFAS discharge value is taken from the ~5 km grid cell
+  # nearest to these coordinates — check the "grid" coords printed during fetching.
+  locations:
+    - name: "Hue"
+      latitude: 16.05
+      longitude: 107.85
+    - name: "Hanoi"
+      latitude: 21.03
+      longitude: 105.85
+    - name: "CanTho"
+      latitude: 10.03
+      longitude: 105.78
+    - name: "District7_HCMCity"
+      latitude: 10.734
+      longitude: 106.705
+    - name: "ThuDuc_HCMCity"
+      latitude: 10.846
+      longitude: 106.752
+
+task:
+  target: flood_risk              # name of the binary label column
+  horizon_days: 1                 # forecast flood_risk at day t + horizon using data up to day t
+  threshold_percentile: 90        # flood = discharge above this per-location percentile (TRAIN period only)
+
+features:
+  lags: [1, 2, 3, 7]              # past discharge lags (days)
+  rain_windows: [3, 7, 14]        # rolling rainfall sums (days)
+  api_decay: 0.9                  # decay factor of the Antecedent Precipitation Index
+
+split:
+  test_start: "2024-01-01"        # chronological hold-out: all days >= this date are test
+  cv_folds: 5                     # number of expanding-window time-series CV folds
+
+models:
+  random_state: 42
+  selection_metric: average_precision   # metric (CV mean) used to pick the best model
+
+output:
+  figures_dir: outputs/figures
+  metrics_dir: outputs/metrics
+  model_path: outputs/models/best_model.joblib
