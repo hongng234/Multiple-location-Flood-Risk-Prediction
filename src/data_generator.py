@@ -1,158 +1,161 @@
+"""Build the RAW daily multi-location dataset (real Open-Meteo data or offline synthetic data).
+
+Both sources return the same schema (see `RAW_COLUMNS`). No labels or features are created here:
+labels need a threshold computed on the TRAIN period only, which happens after the time split.
+"""
 import numpy as np
 import pandas as pd
 
-from src.data_loader import fetch_open_meteo_weather, fetch_open_meteo_discharge
+from src.data_loader import RAW_COLUMNS, fetch_open_meteo_discharge, fetch_open_meteo_weather
 
 
 # ------------------------------------------------------------------
-# 1. SYNTHETIC DATA
+# 1. SYNTHETIC DATA (offline; simple rainfall-runoff simulation)
 # ------------------------------------------------------------------
 def generate_synthetic_flood_data(
-    n_samples: int = 5000, random_state: int = 42
-) -> pd.DataFrame:
-    """Generate synthetic flood data for training the pipeline."""
-    rng = np.random.default_rng(random_state)
-
-    rainfall_24h = rng.gamma(shape=2.0, scale=25.0, size=n_samples)
-    rainfall_72h = rainfall_24h * rng.uniform(1.2, 3.5, n_samples)
-    river_discharge = 50 + rainfall_72h * rng.uniform(0.8, 2.0, n_samples)
-    water_level = 1.0 + river_discharge / rng.uniform(400, 900, n_samples)
-    soil_moisture = np.clip(rng.normal(0.45, 0.15, n_samples), 0.05, 0.95)
-    elevation = rng.uniform(2, 120, n_samples)
-    slope = rng.uniform(0.5, 25, n_samples)
-    drainage_capacity = rng.uniform(20, 200, n_samples)
-    urbanization = rng.uniform(0, 1, n_samples)
-
-    risk_score = (
-        0.9 * (rainfall_24h / 100)
-        + 1.1 * (rainfall_72h / 250)
-        + 1.3 * (water_level / 6)
-        + 0.8 * soil_moisture
-        + 0.5 * urbanization
-        - 0.8 * (elevation / 120)
-        - 0.6 * (drainage_capacity / 200)
-        - 0.3 * (slope / 25)
-    )
-
-    prob = 1 / (1 + np.exp(-(risk_score - 1.6) * 2.2))
-    flood_risk = rng.binomial(1, prob)
-
-    return pd.DataFrame(
-        {
-            "rainfall_24h_mm": rainfall_24h.round(2),
-            "rainfall_72h_mm": rainfall_72h.round(2),
-            "river_discharge_m3s": river_discharge.round(2),
-            "water_level_m": water_level.round(3),
-            "soil_moisture": soil_moisture.round(3),
-            "elevation_m": elevation.round(2),
-            "slope_deg": slope.round(2),
-            "drainage_capacity": drainage_capacity.round(2),
-            "urbanization_index": urbanization.round(3),
-            "flood_risk": flood_risk,
-        }
-    )
-
-
-# ------------------------------------------------------------------
-# 2. OPEN-METEO DATA (real rainfall + discharge → label by threshold)
-# ------------------------------------------------------------------
-def build_dataset_from_open_meteo(
-    locations: list[dict],
+    location_names: list[str],
     start_date: str,
     end_date: str,
-    discharge_threshold_percentile: int = 90,
+    random_state: int = 42,
 ) -> pd.DataFrame:
-    """
-    Load data for MULTIPLE locations, add the location column,
-    and merge everything into a single DataFrame.
-    """
-    all_dfs = []
+    """Simulate daily rain / temperature / discharge per location with a linear-reservoir model.
 
+    What: a fake but physically plausible dataset with the same columns as the real one,
+    so the whole pipeline (and the test suite) can run without internet.
+
+    How:
+      1. A sine wave gives each day a seasonal "wetness" between 0 (dry) and 1 (wet).
+      2. Rain occurs randomly (more often when wet); its amount is drawn from a gamma distribution.
+      3. Discharge follows a linear reservoir: it decays back to a base flow and jumps after rain.
+
+    Args:
+        location_names: one simulated river per name.
+        start_date, end_date: inclusive date range ("YYYY-MM-DD"), one row per day.
+        random_state: seed, so the same inputs always produce the same data.
+
+    Returns:
+        Long DataFrame with columns RAW_COLUMNS, one row per (location, day).
+    """
+    # Shared setup for all locations: random generator, the daily calendar and day-of-year (1..366)
+    rng = np.random.default_rng(random_state)
+    dates = pd.date_range(start_date, end_date, freq="D")
+    doy = dates.dayofyear.to_numpy()
+    frames = []   # one DataFrame per location, concatenated at the end
+
+    # Loop over locations: each iteration builds an independent daily series for one river.
+    # `i` (the location index) is used to shift the rainy season so locations behave differently.
+    for i, name in enumerate(location_names):
+        # Seasonal wetness (0..1), phase-shifted per location so regions differ
+        wet = 0.5 + 0.5 * np.sin(2 * np.pi * (doy - 200 - 20 * i) / 365.25)
+        # Does it rain today? Bernoulli draw with probability 15% (dry season) .. 65% (wet season)
+        rain_occurs = rng.binomial(1, 0.15 + 0.5 * wet)
+        # How much rain (mm)? Gamma draw (many small, few large events), heavier in the wet season;
+        # multiplied by 0/1 so dry days get exactly 0 mm
+        rain = rain_occurs * rng.gamma(0.8, 8 + 30 * wet)
+        # Temperature: yearly cosine cycle around 26 °C (coolest mid-January) + daily noise
+        temp = 26 - 5 * np.cos(2 * np.pi * (doy - 15) / 365.25) + rng.normal(0, 1, len(dates))
+
+        # Each location has its own river size -> thresholds must be per location
+        base = rng.uniform(20, 1500)   # dry-weather base flow (m3/s): small stream .. large river
+        gain = base / 60               # how strongly 1 mm of rain raises discharge (scaled to river size)
+        q = np.empty(len(dates))       # discharge series to fill day by day
+        q[0] = base                    # start the river at base flow
+
+        # Loop over days (starting at day 1): a Python loop is needed because each day's
+        # discharge depends on the previous day's value (recursive, cannot be vectorised simply).
+        for t in range(1, len(dates)):
+            # Reservoir recession + response to yesterday's and today's rain + multiplicative noise
+            #   0.85 * (q[t-1] - base): 85% of yesterday's excess flow remains (recession curve)
+            #   gain * (0.7 * rain[t-1] + 0.3 * rain[t]): runoff mostly arrives with a 1-day delay
+            q[t] = base + 0.85 * (q[t - 1] - base) + gain * (0.7 * rain[t - 1] + 0.3 * rain[t])
+            # Random ±3% measurement/model noise; lognormal keeps discharge strictly positive
+            q[t] *= rng.lognormal(0, 0.03)
+
+        # Store this location's series in long format (one row per day, tagged with its name)
+        frames.append(pd.DataFrame({
+            "date": dates,
+            "location": name,
+            "precipitation_mm": rain.round(2),
+            "temperature_mean_c": temp.round(2),
+            "river_discharge_m3s": q.round(2),
+        }))
+
+    # Stack all locations into one table and enforce the shared raw column order
+    return pd.concat(frames, ignore_index=True)[RAW_COLUMNS]
+
+
+# ------------------------------------------------------------------
+# 2. OPEN-METEO DATA (real rainfall + GloFAS discharge)
+# ------------------------------------------------------------------
+def build_dataset_from_open_meteo(locations: list[dict], start_date: str, end_date: str) -> pd.DataFrame:
+    """Fetch weather + discharge for every location and stack them into one long DataFrame.
+
+    What: the real dataset — daily rain/temperature (Open-Meteo Archive) and daily river
+    discharge (GloFAS via Open-Meteo Flood API) for each configured location.
+
+    How: for each location, call both APIs (network required), inner-join the two results
+    on the date, tag rows with the location name, then concatenate all locations.
+
+    Args:
+        locations: list of {"name", "latitude", "longitude"} dicts from config.yaml.
+        start_date, end_date: inclusive date range ("YYYY-MM-DD").
+
+    Returns:
+        Long DataFrame with columns RAW_COLUMNS, one row per (location, day).
+    """
+    all_dfs = []   # one DataFrame per location
+
+    # Loop over locations: 2 API calls each -> merge -> tag -> keep only the raw columns
     for loc in locations:
-        print(f"Fetching data for: {loc['name']} "
-              f"({loc['latitude']}, {loc['longitude']})")
+        print(f"Fetching data for: {loc['name']} ({loc['latitude']}, {loc['longitude']})")
+        weather = fetch_open_meteo_weather(loc["latitude"], loc["longitude"], start_date, end_date)
+        discharge = fetch_open_meteo_discharge(loc["latitude"], loc["longitude"], start_date, end_date)
 
-        weather = fetch_open_meteo_weather(
-            loc["latitude"], loc["longitude"], start_date, end_date
-        )
-        discharge = fetch_open_meteo_discharge(
-            loc["latitude"], loc["longitude"], start_date, end_date
-        )
+        # Join both sources on calendar day and tag rows with the location name
+        # (inner join: a day missing in either API is dropped, so every row has all values)
+        df = weather.merge(discharge, on="date", how="inner").sort_values("date")
+        df["location"] = loc["name"]
+        all_dfs.append(df[RAW_COLUMNS])
 
-        df = weather.merge(discharge, on="date", how="inner")
-        df = df.sort_values("date").reset_index(drop=True)
-        df["location"] = loc["name"]          # ← gắn tên địa điểm
+        # Print the grid cell the API actually used, so wrong coordinates are easy to spot
+        # (attrs["grid"] is set by data_loader from the API response; a tiny mean discharge
+        #  for a big river means the coordinates hit a small stream instead of the main channel)
+        print(f"  -> {len(df)} rows | weather grid={weather.attrs.get('grid')} "
+              f"| GloFAS grid={discharge.attrs.get('grid')} "
+              f"| mean discharge={df['river_discharge_m3s'].mean():.2f} m3/s")
 
-        # Rolling features
-        df["rainfall_24h_mm"] = df["precipitation_mm"]
-        df["rainfall_72h_mm"] = (
-            df["precipitation_mm"].rolling(window=3, min_periods=1).sum()
-        )
-        df["rainfall_7d_mm"] = (
-            df["precipitation_mm"].rolling(window=7, min_periods=1).sum()
-        )
-        df["discharge_3d_mean"] = (
-            df["river_discharge_m3s"].rolling(window=3, min_periods=1).mean()
-        )
-        df["discharge_7d_mean"] = (
-            df["river_discharge_m3s"].rolling(window=7, min_periods=1).mean()
-        )
-
-        # Label based on the INDIVIDUAL percentile for each location
-        threshold = np.percentile(
-            df["river_discharge_m3s"].dropna(), discharge_threshold_percentile
-        )
-        df["flood_risk"] = (df["river_discharge_m3s"] > threshold).astype(int)
-
-        # Topographic Features (placeholder — can be replaced with an actual DEM)
-        df["elevation_m"] = 15.0
-        df["slope_deg"] = 5.0
-        df["drainage_capacity"] = 100.0
-        df["urbanization_index"] = 0.5
-        df["soil_moisture"] = 0.5
-
-        all_dfs.append(df)
-        print(f"  → {len(df)} rows, flood_risk=1: {df['flood_risk'].sum()} "
-              f"({df['flood_risk'].mean():.1%}), threshold={threshold:.2f}")
-
-    # Combine all locations into a single dataframe
+    # After the loop: stack all locations vertically into one long table
     combined = pd.concat(all_dfs, ignore_index=True)
-
-    cols = [
-        "date", "location",
-        "rainfall_24h_mm", "rainfall_72h_mm", "rainfall_7d_mm",
-        "river_discharge_m3s", "discharge_3d_mean", "discharge_7d_mean",
-        "temperature_mean_c",
-        "elevation_m", "slope_deg", "drainage_capacity",
-        "urbanization_index", "soil_moisture",
-        "flood_risk",
-    ]
-    combined = combined[cols].dropna().reset_index(drop=True)
-
-    print(f"\nCombined dataset: {len(combined)} rows across "
-          f"{combined['location'].nunique()} locations")
-
+    print(f"\nCombined raw dataset: {len(combined)} rows across {combined['location'].nunique()} locations")
     return combined
 
 
 # ------------------------------------------------------------------
-# 3. Dispatcher — Select the source based on the configuration
+# 3. Dispatcher — select the source based on the configuration
 # ------------------------------------------------------------------
 def generate_flood_data(config: dict) -> pd.DataFrame:
-    source = config["data"]["source"]
+    """Return the raw daily dataset from the source named in config['data']['source'].
 
+    What: the single entry point main.py calls; it hides which source is used.
+    How: read `source` from config and forward the relevant config values to the matching builder.
+    """
+    data_cfg = config["data"]
+    source = data_cfg["source"]
+
+    # Synthetic source: simulate data offline; only location NAMES are used (coordinates are ignored)
     if source == "synthetic":
         return generate_synthetic_flood_data(
-            n_samples=config["data"]["n_samples"],
-            random_state=config["data"]["random_state"],
+            location_names=[loc["name"] for loc in data_cfg["locations"]],
+            start_date=data_cfg["start_date"],
+            end_date=data_cfg["end_date"],
+            random_state=data_cfg["random_state"],
         )
-    elif source == "open_meteo":
-        om = config["data"]["open_meteo"]
+    # Open-Meteo source: download real data for every configured location (needs internet)
+    if source == "open_meteo":
         return build_dataset_from_open_meteo(
-            locations=om["locations"],          
-            start_date=om["start_date"],
-            end_date=om["end_date"],
-            discharge_threshold_percentile=om["discharge_threshold_percentile"],
+            locations=data_cfg["locations"],
+            start_date=data_cfg["start_date"],
+            end_date=data_cfg["end_date"],
         )
-    else:
-        raise ValueError(f"Unknown data source: {source}")
+    # Any other source name is a config mistake: fail fast with a clear error instead of returning nothing
+    raise ValueError(f"Unknown data source: {source}")
