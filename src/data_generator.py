@@ -3,9 +3,10 @@
 Both sources return the same schema (see `RAW_COLUMNS`). No labels or features are created here:
 labels need a threshold computed on the TRAIN period only, which happens after the time split.
 """
-import numpy as np
-import pandas as pd
+import numpy as np    # fast numeric arrays + random number generation for the synthetic data
+import pandas as pd   # DataFrames (tables) and date ranges
 
+# Shared raw column list + the two API download functions (real data source)
 from src.data_loader import RAW_COLUMNS, fetch_open_meteo_discharge, fetch_open_meteo_weather
 
 
@@ -139,8 +140,8 @@ def generate_flood_data(config: dict) -> pd.DataFrame:
     What: the single entry point main.py calls; it hides which source is used.
     How: read `source` from config and forward the relevant config values to the matching builder.
     """
-    data_cfg = config["data"]
-    source = data_cfg["source"]
+    data_cfg = config["data"]       # the "data:" section of config.yaml
+    source = data_cfg["source"]     # "synthetic" or "open_meteo"
 
     # Synthetic source: simulate data offline; only location NAMES are used (coordinates are ignored)
     if source == "synthetic":

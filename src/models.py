@@ -1,11 +1,15 @@
-"""Model zoo: baselines + ML classifiers, each wrapped with its own preprocessor."""
-import numpy as np
-import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin, clone
-from sklearn.dummy import DummyClassifier
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import Pipeline
+"""Model zoo: baselines + ML classifiers, each wrapped with its own preprocessor.
+
+A "baseline" is a very simple rule used as a yardstick: a machine-learning model is only
+worth using if it scores better than these rules.
+"""
+import numpy as np    # arrays for the baseline's probability output
+import pandas as pd   # read a named column from the input table
+from sklearn.base import BaseEstimator, ClassifierMixin, clone   # base classes for a custom model; clone = fresh unfitted copy
+from sklearn.dummy import DummyClassifier                         # "always guess the most common answer" model
+from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier  # tree-ensemble models
+from sklearn.linear_model import LogisticRegression              # linear model that outputs probabilities
+from sklearn.pipeline import Pipeline                            # chains the preprocessor and the classifier
 
 # Reference models that are reported but never selected as "best model"
 BASELINES = {"DummyBaseline", "PersistenceBaseline"}
@@ -33,9 +37,9 @@ class PersistenceBaseline(ClassifierMixin, BaseEstimator):
     def predict_proba(self, X):
         # Hard 0/1 "probability" from the persistence rule
         # (above threshold today -> P(flood)=1, otherwise 0; columns are [P(no flood), P(flood)])
-        values = pd.DataFrame(X)[self.column].to_numpy(dtype=float)
-        p = (values > 1.0).astype(float)
-        return np.column_stack([1 - p, p])
+        values = pd.DataFrame(X)[self.column].to_numpy(dtype=float)   # today's discharge / threshold, per row
+        p = (values > 1.0).astype(float)                              # 1.0 if above flood level, else 0.0
+        return np.column_stack([1 - p, p])                            # two columns, like every sklearn classifier
 
     def predict(self, X):
         # Class label = 1 when P(flood) >= 0.5 (here: exactly when the rule fires)
@@ -60,12 +64,17 @@ def get_models(preprocessor, random_state: int = 42) -> dict:
 
     return {
         "DummyBaseline": DummyClassifier(strategy="prior"),     # always predicts the base rate
-        "PersistenceBaseline": PersistenceBaseline(),
+        "PersistenceBaseline": PersistenceBaseline(),           # "tomorrow = today" rule (see class above)
+        # Linear model; max_iter = enough optimisation steps to converge
         "LogisticRegression": wrap(LogisticRegression(
             max_iter=2000, class_weight="balanced", random_state=random_state)),
+        # 300 independent decision trees that vote; depth/leaf limits keep each tree from memorising noise;
+        # n_jobs=-1 uses all CPU cores
         "RandomForest": wrap(RandomForestClassifier(
             n_estimators=300, max_depth=12, min_samples_leaf=3, class_weight="balanced",
             random_state=random_state, n_jobs=-1)),
+        # 200 small trees built one after another, each correcting the previous ones' errors;
+        # learning_rate = how much each new tree is allowed to change the prediction
         "GradientBoosting": wrap(GradientBoostingClassifier(
             n_estimators=200, learning_rate=0.08, max_depth=3, random_state=random_state)),
     }

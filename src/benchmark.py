@@ -1,17 +1,25 @@
-"""Cross-validation, hold-out evaluation, per-location metrics and model selection."""
-import warnings
+"""Cross-validation, hold-out evaluation, per-location metrics and model selection.
 
-import numpy as np
-import pandas as pd
-from sklearn.base import clone
-from sklearn.exceptions import UndefinedMetricWarning
-from sklearn.metrics import (
+Metric cheat-sheet (1 = flood day):
+  precision: of the days we raised an alert, how many really flooded
+  recall:    of the real flood days, how many we caught
+  f1:        balance (harmonic mean) of precision and recall
+  roc_auc / average_precision (PR-AUC): how well the probabilities rank flood days above
+             normal days, independent of the 0.5 alert threshold
+"""
+import warnings      # to silence expected, harmless warnings during CV
+
+import numpy as np    # NaN-aware averaging and array checks
+import pandas as pd   # result tables
+from sklearn.base import clone                              # fresh, unfitted copy of a model
+from sklearn.exceptions import UndefinedMetricWarning      # warning type raised when a metric can't be computed
+from sklearn.metrics import (                               # metric functions (see cheat-sheet above)
     accuracy_score, average_precision_score, f1_score,
     precision_score, recall_score, roc_auc_score,
 )
-from sklearn.model_selection import cross_validate
+from sklearn.model_selection import cross_validate         # runs fit/score over all CV folds
 
-from src.models import BASELINES
+from src.models import BASELINES   # names of reference models that must never be selected as "best"
 
 # Metrics computed in cross-validation (sklearn scorer names); average_precision = PR-AUC
 SCORING = ["accuracy", "precision", "recall", "f1", "roc_auc", "average_precision"]
@@ -24,7 +32,7 @@ def _metrics(y_true, y_pred, y_proba) -> dict:
     ranking metrics (ROC-AUC, PR-AUC) use probabilities. ROC/PR-AUC are undefined when a
     subset (e.g. one location) has no flood day, so NaN is returned there instead of crashing.
     """
-    both_classes = len(np.unique(y_true)) == 2
+    both_classes = len(np.unique(y_true)) == 2   # True when the data has both flood and no-flood days
     return {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
@@ -50,7 +58,7 @@ def cross_validate_models(models: dict, X, y, cv) -> tuple[pd.DataFrame, pd.Data
         summary: one row per model with mean metrics, sorted by PR-AUC.
         folds: one row per (model, fold) — used for the CV stability chart.
     """
-    summary, folds = [], []
+    summary, folds = [], []   # rows for the two result tables, filled inside the loop
     # Loop over models: run CV for each and collect mean + per-fold scores
     for name, model in models.items():
         # Silence expected warnings only inside this block (they would flood the console)
@@ -63,14 +71,15 @@ def cross_validate_models(models: dict, X, y, cv) -> tuple[pd.DataFrame, pd.Data
         # Average each metric over folds, ignoring NaN folds
         row = {"model": name}
         for m in SCORING:
-            row[m] = np.nanmean(scores[f"test_{m}"])
-        row["fit_time_s"] = scores["fit_time"].mean()
+            row[m] = np.nanmean(scores[f"test_{m}"])   # scores["test_f1"] = array with one value per fold
+        row["fit_time_s"] = scores["fit_time"].mean()  # average training time per fold (seconds)
         summary.append(row)
 
         # Keep the raw score of every fold (fold numbers start at 1 for readability)
         for i in range(len(scores["fit_time"])):
             folds.append({"model": name, "fold": i + 1, **{m: scores[f"test_{m}"][i] for m in SCORING}})
 
+    # Build the tables; best PR-AUC first
     summary_df = pd.DataFrame(summary).sort_values("average_precision", ascending=False)
     return summary_df.reset_index(drop=True), pd.DataFrame(folds)
 
@@ -84,14 +93,15 @@ def evaluate_on_test(models: dict, X_train, y_train, X_test, y_test) -> tuple[pd
     Returns:
         (metrics table, fitted models, test probabilities per model).
     """
-    rows, fitted, probas = [], {}, {}
+    rows, fitted, probas = [], {}, {}   # metric rows, {name: trained model}, {name: test probabilities}
     # Loop over models: fit once on full train, evaluate once on test
     for name, model in models.items():
-        est = clone(model).fit(X_train, y_train)
+        est = clone(model).fit(X_train, y_train)    # train a fresh copy on all train rows
         y_proba = est.predict_proba(X_test)[:, 1]   # column 1 = P(flood)
-        y_pred = est.predict(X_test)
+        y_pred = est.predict(X_test)                # hard 0/1 decision (alert if P(flood) >= 0.5)
+        # `**` merges the metric dict into the row: {"model": ..., "accuracy": ..., ...}
         rows.append({"model": name, **_metrics(y_test, y_pred, y_proba)})
-        fitted[name], probas[name] = est, y_proba
+        fitted[name], probas[name] = est, y_proba   # keep them for charts and per-location metrics
     return pd.DataFrame(rows), fitted, probas
 
 
@@ -107,14 +117,14 @@ def evaluate_per_location(fitted: dict, X_test, y_test, locations) -> pd.DataFra
     # Plain positional Series so boolean masks line up with the prediction arrays
     locations = pd.Series(np.asarray(locations))
     y_test = pd.Series(np.asarray(y_test))
-    rows = []
+    rows = []   # one dict per (model, location), turned into a table at the end
     # Outer loop over fitted models: predict the full test set once per model
     for name, est in fitted.items():
         y_proba = est.predict_proba(X_test)[:, 1]
         y_pred = est.predict(X_test)
         # Inner loop over locations: score only the rows belonging to that location
         for loc in sorted(locations.unique()):
-            mask = (locations == loc).to_numpy()
+            mask = (locations == loc).to_numpy()   # True for the rows of this location only
             rows.append({
                 "model": name, "location": loc,
                 "n_days": int(mask.sum()), "n_floods": int(y_test[mask].sum()),
@@ -128,5 +138,6 @@ def select_best_model(cv_results: pd.DataFrame, metric: str = "average_precision
 
     How: drop baseline rows, sort the rest by `metric` (descending) and return the top name.
     """
-    candidates = cv_results[~cv_results["model"].isin(BASELINES)]
+    candidates = cv_results[~cv_results["model"].isin(BASELINES)]   # `~` = NOT: keep only the ML models
+    # Highest score first, then take the name in the first row
     return candidates.sort_values(metric, ascending=False).iloc[0]["model"]

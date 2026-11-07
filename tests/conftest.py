@@ -2,14 +2,14 @@
 
 pytest loads this file automatically; any test can request a fixture by naming it as an argument.
 """
-import sys
-from pathlib import Path
+import sys                 # access to Python's module search path
+from pathlib import Path   # file paths
 
-import pytest
+import pytest              # test framework: fixtures, assertions, temp folders
 
 # Make `src` and `main` importable when pytest runs from any folder
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+ROOT = Path(__file__).resolve().parents[1]   # project root = parent of the tests/ folder
+sys.path.insert(0, str(ROOT))                # search the project root first when importing
 
 from src.data_generator import generate_synthetic_flood_data  # noqa: E402
 from src.features import add_threshold_features, build_timeseries_features  # noqa: E402
@@ -41,10 +41,10 @@ def labelled_split(feature_df):
 
     How: chronological split -> thresholds from train -> label + threshold features on both sides.
     """
-    train, test = time_split(feature_df, TEST_START)
-    thr = compute_thresholds(train, 90)
-    train = add_threshold_features(apply_labels(train, thr), thr)
-    test = add_threshold_features(apply_labels(test, thr), thr)
+    train, test = time_split(feature_df, TEST_START)                # chronological split
+    thr = compute_thresholds(train, 90)                             # P90 per location, train rows only
+    train = add_threshold_features(apply_labels(train, thr), thr)   # label + relative features
+    test = add_threshold_features(apply_labels(test, thr), thr)     # same train thresholds on test
     return train, test, thr
 
 

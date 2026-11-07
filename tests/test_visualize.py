@@ -1,10 +1,13 @@
-"""Every plotting function writes a non-empty PNG."""
+"""Every plotting function writes a non-empty PNG.
+
+These tests don't check how the charts look, only that each one is drawn without errors.
+"""
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression   # a fast model to feed the model-based charts
 from sklearn.pipeline import Pipeline
 
-from src import visualize as viz
+from src import visualize as viz   # module under test, short alias
 from src.features import feature_columns
 from src.preprocessing import build_preprocessor
 
@@ -17,7 +20,8 @@ def _ok(path):
 def test_eda_plots(tmp_path, raw_df, labelled_split):
     """The four EDA charts render from the labelled synthetic data."""
     train, test, thr = labelled_split
-    df = pd.concat([train, test])
+    df = pd.concat([train, test])   # all labelled rows
+    # Draw the four charts into the temp folder as a.png ... d.png
     viz.plot_discharge_overview(raw_df, thr, "2022-01-01", tmp_path / "a.png")
     viz.plot_class_distribution(df, "flood_risk", tmp_path / "b.png")
     viz.plot_monthly_flood_frequency(df, "flood_risk", tmp_path / "c.png")
@@ -32,8 +36,9 @@ def test_benchmark_plots(tmp_path, labelled_split):
     num = feature_columns(train)
     model = Pipeline([("prep", build_preprocessor(num, ["location"])), ("clf", LogisticRegression(max_iter=500))])
     model.fit(train[num + ["location"]], train["flood_risk"])
-    p = model.predict_proba(test[num + ["location"]])[:, 1]
-    y = test["flood_risk"]
+    p = model.predict_proba(test[num + ["location"]])[:, 1]   # P(flood) per test row
+    y = test["flood_risk"]                                    # true labels
+    # Two "models": a constant guess (flood rate) and the fitted logistic regression
     probas = {"Dummy": np.full(len(y), y.mean()), "LR": p}
 
     # Fake result tables with the same columns the pipeline produces

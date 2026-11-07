@@ -5,13 +5,14 @@ Usage:
     python main.py --refresh      # re-download data from Open-Meteo
     python main.py --config other.yaml
 """
-import argparse
-import json
-from pathlib import Path
+import argparse            # reads command-line flags such as --refresh
+import json                # writes the thresholds as a JSON file
+from pathlib import Path   # file/folder paths
 
-import joblib
-import pandas as pd
+import joblib              # saves/loads Python objects (the trained model bundle) to disk
+import pandas as pd        # DataFrames
 
+# Project modules: one per pipeline step (see the numbered steps inside run())
 from src.benchmark import cross_validate_models, evaluate_on_test, evaluate_per_location, select_best_model
 from src.config import ensure_dirs, load_config
 from src.data_generator import generate_flood_data
@@ -32,12 +33,12 @@ def load_raw(config: dict, refresh: bool = False) -> pd.DataFrame:
     How: reuse data/raw/flood_data.csv only if it exists, `refresh` is off, its columns match
     RAW_COLUMNS and it holds exactly the configured locations; otherwise rebuild and save it.
     """
-    raw_path = config["data"]["raw_path"]
+    raw_path = config["data"]["raw_path"]   # where the raw CSV cache lives (data/raw/...)
     # Try the cache first (skipped entirely when --refresh is given or the file doesn't exist)
     if not refresh and Path(raw_path).exists():
         df = load_csv(raw_path)
         # Re-fetch when the cache comes from an older schema or a different location list
-        expected_locs = {loc["name"] for loc in config["data"]["locations"]}
+        expected_locs = {loc["name"] for loc in config["data"]["locations"]}   # set of names from config.yaml
         # Cache matches the current config: use it as-is
         if list(df.columns) == RAW_COLUMNS and set(df["location"]) == expected_locs:
             print(f"Loaded cached raw data: {raw_path}")
@@ -65,12 +66,12 @@ def run(config: dict, refresh: bool = False) -> dict:
     Returns:
         dict with result tables, thresholds, the best model name, the saved bundle and train/test frames.
     """
-    # Shortcuts to frequently used config sections and output folders
+    # Create output folders, then keep shortcuts to frequently used config sections and output folders
     ensure_dirs(config)
-    fig_dir = Path(config["output"]["figures_dir"])
-    met_dir = Path(config["output"]["metrics_dir"])
+    fig_dir = Path(config["output"]["figures_dir"])   # charts go here
+    met_dir = Path(config["output"]["metrics_dir"])   # metric tables go here
     task, feat_cfg, split_cfg = config["task"], config["features"], config["split"]
-    target, horizon = task["target"], task["horizon_days"]
+    target, horizon = task["target"], task["horizon_days"]   # label column name ("flood_risk"), lead time in days
 
     # 1. Raw data -> clean
     raw = clean_data(load_raw(config, refresh))
@@ -83,50 +84,52 @@ def run(config: dict, refresh: bool = False) -> dict:
 
     # 3. Chronological split FIRST, then thresholds from TRAIN only, then labels
     #    (the same train thresholds label the test set, exactly as they would in production)
-    train, test = time_split(df, split_cfg["test_start"])
-    thresholds = compute_thresholds(train, task["threshold_percentile"])
+    train, test = time_split(df, split_cfg["test_start"])                  # older years vs. the final year
+    thresholds = compute_thresholds(train, task["threshold_percentile"])   # {location: P90 discharge}
+    # Add the 0/1 label, then the "discharge / threshold" features, to each side
     train = add_threshold_features(apply_labels(train, thresholds, target), thresholds)
     test = add_threshold_features(apply_labels(test, thresholds, target), thresholds)
     # Save the labelled data with a "split" column for inspection
     save_csv(pd.concat([train.assign(split="train"), test.assign(split="test")]), config["data"]["processed_path"])
+    # Print each period's date range, size and share of flood days
     print(f"\nTrain: {train['date'].min().date()} -> {train['date'].max().date()} ({len(train)} rows, "
           f"flood rate {train[target].mean():.1%})")
     print(f"Test : {test['date'].min().date()} -> {test['date'].max().date()} ({len(test)} rows, "
           f"flood rate {test[target].mean():.1%})")
 
     # 4. Feature matrix: numeric features + location (one-hot inside the pipeline)
-    num_cols = feature_columns(train, target)
-    X_cols = num_cols + ["location"]
+    num_cols = feature_columns(train, target)   # every numeric feature column
+    X_cols = num_cols + ["location"]            # model inputs = numeric features + location name
     train = train.sort_values(["date", "location"]).reset_index(drop=True)   # chronological for CV
-    X_train, y_train = train[X_cols], train[target]
-    X_test, y_test = test[X_cols], test[target]
+    X_train, y_train = train[X_cols], train[target]   # X = inputs, y = answers (0/1) for training
+    X_test, y_test = test[X_cols], test[target]       # same for the hold-out test year
 
     # 5. EDA charts (data overview before any modelling)
     viz.plot_discharge_overview(raw, thresholds, split_cfg["test_start"], fig_dir / "discharge_overview.png")
-    labelled = pd.concat([train, test])
+    labelled = pd.concat([train, test])   # all labelled rows, for the class/seasonality charts
     viz.plot_class_distribution(labelled, target, fig_dir / "class_distribution.png")
     viz.plot_monthly_flood_frequency(labelled, target, fig_dir / "monthly_flood_frequency.png")
     viz.plot_correlation_heatmap(train[num_cols + [target]], fig_dir / "correlation_heatmap.png")
 
     # 6. Time-series cross-validation on the train period
     #    (folds split on dates with a gap of `horizon` days so labels never overlap validation)
-    models = get_models(build_preprocessor(num_cols, ["location"]), config["models"]["random_state"])
-    cv = time_series_cv_splits(train["date"], n_splits=split_cfg["cv_folds"], gap_days=horizon)
-    cv_results, cv_folds = cross_validate_models(models, X_train, y_train, cv)
+    models = get_models(build_preprocessor(num_cols, ["location"]), config["models"]["random_state"])   # {name: model}
+    cv = time_series_cv_splits(train["date"], n_splits=split_cfg["cv_folds"], gap_days=horizon)        # fold row indices
+    cv_results, cv_folds = cross_validate_models(models, X_train, y_train, cv)   # mean table + per-fold table
     print("\n=== Time-series CV (train period) ===")
     print(cv_results.to_string(index=False, float_format="%.3f"))
 
     # 7. Hold-out test evaluation (all models refit on full train)
-    test_results, fitted, probas = evaluate_on_test(models, X_train, y_train, X_test, y_test)
-    per_loc = evaluate_per_location(fitted, X_test, y_test, test["location"])
+    test_results, fitted, probas = evaluate_on_test(models, X_train, y_train, X_test, y_test)   # metrics, trained models, P(flood)
+    per_loc = evaluate_per_location(fitted, X_test, y_test, test["location"])                  # same metrics, split by location
     print("\n=== Test set (hold-out) ===")
     print(test_results.to_string(index=False, float_format="%.3f"))
 
     # 8. Select best model by CV (not test) and report it
     #    (the per-location table compares it with the persistence baseline it has to beat)
-    metric = config["models"]["selection_metric"]
-    best_name = select_best_model(cv_results, metric)
-    best = fitted[best_name]
+    metric = config["models"]["selection_metric"]       # e.g. "average_precision" (PR-AUC)
+    best_name = select_best_model(cv_results, metric)   # name of the winning ML model
+    best = fitted[best_name]                            # its trained Pipeline object
     print(f"\nBest model by CV {metric}: {best_name}")
     print(per_loc[per_loc["model"].isin([best_name, "PersistenceBaseline"])]
           .to_string(index=False, float_format="%.3f"))
@@ -153,17 +156,18 @@ def run(config: dict, refresh: bool = False) -> dict:
 
     # 11. Save the model bundle (pipeline + everything needed to rebuild features at inference)
     bundle = {
-        "model": best,
+        "model": best,                       # trained Pipeline (preprocessing + classifier)
         "model_name": best_name,
-        "feature_columns": X_cols,
-        "thresholds": thresholds,
+        "feature_columns": X_cols,           # exact input columns, in training order
+        "thresholds": thresholds,            # train flood levels, needed for the relative features
         "horizon_days": horizon,
-        "features_config": feat_cfg,
-        "trained_until": str(train["target_date"].max().date()),
+        "features_config": feat_cfg,         # lags/windows used, so predict.py builds identical features
+        "trained_until": str(train["target_date"].max().date()),   # last day the model learned from
     }
-    joblib.dump(bundle, config["output"]["model_path"])
+    joblib.dump(bundle, config["output"]["model_path"])   # write the dict to a .joblib file
     print(f"Saved model bundle: {config['output']['model_path']}")
 
+    # Hand the main results back to the caller (tests inspect them)
     return {
         "cv_results": cv_results, "test_results": test_results, "per_location": per_loc,
         "thresholds": thresholds, "best_model_name": best_name, "bundle": bundle,
@@ -178,14 +182,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     """
     parser = argparse.ArgumentParser(description="Multi-location flood risk forecasting pipeline")
     parser.add_argument("--config", default="config.yaml", help="path to YAML config")
+    # store_true: the flag takes no value; present -> True, absent -> False
     parser.add_argument("--refresh", action="store_true", help="re-download/rebuild raw data")
-    return parser.parse_args(argv)
+    return parser.parse_args(argv)   # object with .config and .refresh attributes
 
 
 def main(argv=None) -> None:
     """CLI entry point: parse flags, load the config, run the pipeline."""
-    args = parse_args(argv)
-    run(load_config(args.config), refresh=args.refresh)
+    args = parse_args(argv)                               # read the command-line flags
+    run(load_config(args.config), refresh=args.refresh)   # load settings and run every pipeline step
 
 
 # Run only when executed as a script (not when imported by tests)

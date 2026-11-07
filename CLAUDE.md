@@ -30,7 +30,6 @@ Multi-location **next-day flood-risk forecasting** for 5 Vietnamese locations. D
 - No random/shuffled splits on this time-series data.
 
 ## Conventions
-- Code comments and docstrings: short, English. User-facing docs (README, docs/) are bilingual EN/VI.
 - Charts: fixed categorical `visualize.PALETTE` order (CVD-validated), no dual y-axes (use stacked panels), `matplotlib.use("Agg")`.
 - Tests must stay offline: use the synthetic generator or monkeypatch `requests.get` / fetchers.
 - Known data caveat: GloFAS snaps coordinates to the nearest ~5 km cell; Hue, Hanoi and ThuDuc currently hit small streams (mean discharge ≈ 2–3 m³/s). Check the printed grid coords when changing locations.

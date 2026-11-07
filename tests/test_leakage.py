@@ -1,35 +1,41 @@
-"""Guards against data leakage — these invariants must never break."""
-import numpy as np
-import pandas as pd
+"""Guards against data leakage — these invariants must never break.
+
+Leakage = the model sees, during training, information it would not have at prediction time
+(e.g. tomorrow's discharge or test-period statistics). Scores then look great but are fake.
+Each fixture argument (labelled_split, feature_df, tmp_config) comes from tests/conftest.py.
+"""
+import numpy as np    # numeric comparisons
+import pandas as pd   # timestamps
 
 from src.features import feature_columns
 from src.preprocessing import compute_thresholds, time_series_cv_splits, time_split
-from tests.conftest import TEST_START
+from tests.conftest import TEST_START   # the first day of the test period used by all fixtures
 
 
 def test_train_targets_end_before_test_starts(labelled_split):
     """No train label refers to a test-period day, and train/test do not overlap in time."""
-    train, test, _ = labelled_split
+    train, test, _ = labelled_split   # `_` ignores the thresholds (not needed here)
     assert train["target_date"].max() < pd.Timestamp(TEST_START)   # no train label inside test period
-    assert test["date"].min() >= pd.Timestamp(TEST_START)
-    assert train["date"].max() < test["date"].min()
+    assert test["date"].min() >= pd.Timestamp(TEST_START)          # test starts exactly at the cut-off or later
+    assert train["date"].max() < test["date"].min()                # all train days come before all test days
 
 
 def test_thresholds_use_train_only(feature_df):
     """Changing test-period discharge must not change the thresholds."""
     train, _ = time_split(feature_df, TEST_START)
-    thr = compute_thresholds(train, 90)
+    thr = compute_thresholds(train, 90)   # reference thresholds from the original data
 
     # Inflate only test-period discharge 100×; thresholds must stay identical
     tampered = feature_df.copy()
     tampered.loc[tampered["date"] >= TEST_START, "q_t"] *= 100
     train2, _ = time_split(tampered, TEST_START)
-    assert compute_thresholds(train2, 90) == thr
+    assert compute_thresholds(train2, 90) == thr   # same dict -> test data had no influence
 
 
 def test_thresholds_are_per_location(labelled_split):
     """Each location's threshold equals the P90 of its OWN train discharge."""
     train, _, thr = labelled_split
+    # Recompute P90 by hand for each location and compare with the pipeline's value
     for loc, g in train.groupby("location"):
         assert thr[loc] == np.percentile(g["q_t"], 90)
 
@@ -37,7 +43,7 @@ def test_thresholds_are_per_location(labelled_split):
 def test_label_and_its_source_are_not_features(labelled_split):
     """flood_risk and q_future are never part of the model inputs."""
     train, _, _ = labelled_split
-    cols = feature_columns(train)
+    cols = feature_columns(train)   # exactly the columns the models will receive
     assert "flood_risk" not in cols and "q_future" not in cols
 
 
@@ -46,17 +52,18 @@ def test_no_feature_is_a_copy_of_the_label_source(labelled_split):
     train, _, _ = labelled_split
     # For every feature, count how often it is numerically equal to q_future
     for c in feature_columns(train):
-        same_day = np.isclose(train[c], train["q_future"]).mean()
+        same_day = np.isclose(train[c], train["q_future"]).mean()   # share of rows where the values match
+        # The text after the comma is the error message shown if the check fails
         assert same_day < 0.5, f"{c} equals q_future on {same_day:.0%} of rows"
 
 
 def test_cv_folds_are_chronological_with_gap(labelled_split):
     """Every CV fold validates on days strictly after its training days, with a gap, never splitting a day."""
     train, _, _ = labelled_split
-    train = train.sort_values(["date", "location"]).reset_index(drop=True)
+    train = train.sort_values(["date", "location"]).reset_index(drop=True)   # same order as main.py
     # Check each fold: train period ends, then at least one empty day, then validation starts
     for tr, va in time_series_cv_splits(train["date"], n_splits=3, gap_days=1):
-        tr_max, va_min = train.loc[tr, "date"].max(), train.loc[va, "date"].min()
+        tr_max, va_min = train.loc[tr, "date"].max(), train.loc[va, "date"].min()   # last train day, first validation day
         assert tr_max < va_min
         assert (va_min - tr_max).days >= 2   # gap of 1 full day between folds
         # every day is entirely in one side (all locations together)
@@ -65,11 +72,13 @@ def test_cv_folds_are_chronological_with_gap(labelled_split):
 
 def test_preprocessing_is_fit_inside_pipeline(tmp_config):
     """ML models must carry their own preprocessor so CV refits it per fold."""
+    # Imports local to this test (only needed here)
     from sklearn.pipeline import Pipeline
 
     from src.models import get_models
     from src.preprocessing import build_preprocessor
 
+    # A dummy preprocessor (one numeric column "a") is enough to inspect the model structure
     models = get_models(build_preprocessor(["a"], ["location"]))
     # Each ML model must be a Pipeline whose first step is the preprocessor
     for name in ["LogisticRegression", "RandomForest", "GradientBoosting"]:

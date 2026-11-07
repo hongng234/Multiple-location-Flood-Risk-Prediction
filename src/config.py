@@ -1,7 +1,11 @@
-"""Config loading and output-directory setup."""
-from pathlib import Path
+"""Config loading and output-directory setup.
 
-import yaml
+Every setting of the project (locations, dates, model options, output paths) lives in
+config.yaml. This module reads that file and prepares the folders the pipeline writes into.
+"""
+from pathlib import Path   # object-oriented file paths (works on Windows and Linux alike)
+
+import yaml                # PyYAML: parses the human-readable config.yaml into Python dicts/lists
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -17,7 +21,9 @@ def load_config(path: str = "config.yaml") -> dict:
     Returns:
         Nested dict, e.g. config["data"]["locations"].
     """
+    # `with` closes the file automatically, even if parsing fails
     with open(path, "r", encoding="utf-8") as f:
+        # Parse the YAML text into a nested dict and hand it back to the caller
         return yaml.safe_load(f)
 
 
@@ -30,11 +36,11 @@ def ensure_dirs(config: dict) -> None:
     """
     # Parent folders of every file the pipeline writes + the figure/metric folders themselves
     dirs = [
-        Path(config["data"]["raw_path"]).parent,
-        Path(config["data"]["processed_path"]).parent,
-        Path(config["output"]["figures_dir"]),
-        Path(config["output"]["metrics_dir"]),
-        Path(config["output"]["model_path"]).parent,
+        Path(config["data"]["raw_path"]).parent,         # folder of the downloaded raw CSV (data/raw)
+        Path(config["data"]["processed_path"]).parent,   # folder of the labelled CSV (data/processed)
+        Path(config["output"]["figures_dir"]),           # all PNG charts (outputs/figures)
+        Path(config["output"]["metrics_dir"]),           # metric tables + thresholds (outputs/metrics)
+        Path(config["output"]["model_path"]).parent,     # saved model bundle (outputs/models)
     ]
     # Create each folder; parents=True builds missing intermediate folders, exist_ok=True makes reruns safe
     for d in dirs:

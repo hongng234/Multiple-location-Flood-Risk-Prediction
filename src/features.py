@@ -5,10 +5,13 @@ and is computed within its own location (groupby) so series never bleed into eac
 The only forward-looking column is `q_future` (discharge at t + horizon), which is the label
 SOURCE — it is never used as a feature.
 """
-import numpy as np
-import pandas as pd
+import numpy as np    # math helpers (sin/cos) and numeric dtype checks
+import pandas as pd   # DataFrames, groupby, rolling windows and shifts
 
-# Columns that must never be fed to a model (identifiers, label source, label)
+# Columns that must never be fed to a model (identifiers, label source, label):
+#   date / target_date: calendar days (identifiers, not measurements)
+#   location: handled separately via one-hot encoding in the model pipeline
+#   q_future: tomorrow's discharge = the answer itself; using it as input would be cheating (leakage)
 NON_FEATURE_COLUMNS = {"date", "location", "q_future", "target_date"}
 
 
@@ -44,12 +47,12 @@ def build_timeseries_features(
         DataFrame with date, location, all feature columns, q_future and target_date.
     """
     # Sort so that "previous row" == "previous day of the same location", then group by location
-    df = df.sort_values(["location", "date"]).reset_index(drop=True).copy()
-    g = df.groupby("location", group_keys=False)
-    out = df[["date", "location"]].copy()
+    df = df.sort_values(["location", "date"]).reset_index(drop=True).copy()   # copy: never modify the caller's data
+    g = df.groupby("location", group_keys=False)   # g["col"].shift/rolling now runs per location
+    out = df[["date", "location"]].copy()           # result table: starts with the row identifiers only
 
     # --- Rainfall (observed up to day t) ---
-    out["rain_1d"] = df["precipitation_mm"]
+    out["rain_1d"] = df["precipitation_mm"]          # rain on day t itself (mm)
     # Loop over window lengths: one rolling-sum column per window (e.g. rain_3d, rain_7d);
     # `w=w` freezes the current window inside the lambda; min_periods=1 avoids NaN at series start
     for w in rain_windows:
@@ -61,18 +64,19 @@ def build_timeseries_features(
     )
 
     # --- Discharge observed up to day t (legit for forecasting t + horizon) ---
-    out["q_t"] = df["river_discharge_m3s"]
+    out["q_t"] = df["river_discharge_m3s"]          # discharge on day t (today)
     # Loop over lags: shift(k) moves each location's series down k rows -> value from k days ago
     for k in lags:
         out[f"q_lag_{k}"] = g["river_discharge_m3s"].shift(k)
+    # Average discharge over the last 3 and 7 days (smooths out daily noise; shows the recent trend level)
     out["q_3d_mean"] = g["river_discharge_m3s"].transform(lambda s: s.rolling(3, min_periods=1).mean())
     out["q_7d_mean"] = g["river_discharge_m3s"].transform(lambda s: s.rolling(7, min_periods=1).mean())
     out["q_diff_1d"] = out["q_t"] - g["river_discharge_m3s"].shift(1)    # rising / falling limb
 
     # --- Weather + seasonality ---
-    out["temperature_mean_c"] = df["temperature_mean_c"]
+    out["temperature_mean_c"] = df["temperature_mean_c"]   # mean temperature of day t (°C)
     # Encode day-of-year on a circle so Dec 31 and Jan 1 are close (a raw 1..365 number would not be)
-    doy = df["date"].dt.dayofyear
+    doy = df["date"].dt.dayofyear                          # 1 = Jan 1 ... 365/366 = Dec 31
     out["doy_sin"] = np.sin(2 * np.pi * doy / 365.25)
     out["doy_cos"] = np.cos(2 * np.pi * doy / 365.25)
 
@@ -84,7 +88,8 @@ def build_timeseries_features(
     # For training, drop the first rows of each location (incomplete lag history) and the last
     # `horizon` rows (no future value to label); inference keeps them because q_future is unknown anyway
     if drop_incomplete:
-        lag_cols = [f"q_lag_{k}" for k in lags]
+        lag_cols = [f"q_lag_{k}" for k in lags]   # e.g. ["q_lag_1", "q_lag_2", "q_lag_3", "q_lag_7"]
+        # Remove any row where one of these columns is empty (NaN), then renumber rows
         out = out.dropna(subset=lag_cols + ["q_t", "q_future"]).reset_index(drop=True)
     return out
 
@@ -97,10 +102,10 @@ def add_threshold_features(df: pd.DataFrame, thresholds: dict) -> pd.DataFrame:
     How: map each row's location to its threshold, then divide today's discharge and the
     7-day mean by it. A value > 1 means "already above flood level".
     """
-    df = df.copy()
-    thr = df["location"].map(thresholds)
-    df["q_t_rel"] = df["q_t"] / thr
-    df["q_7d_rel"] = df["q_7d_mean"] / thr
+    df = df.copy()                              # work on a copy so the input table is unchanged
+    thr = df["location"].map(thresholds)        # per-row threshold: location name -> its m3/s threshold
+    df["q_t_rel"] = df["q_t"] / thr             # today's discharge as a fraction of flood level
+    df["q_7d_rel"] = df["q_7d_mean"] / thr      # last-7-day mean discharge as a fraction of flood level
     return df
 
 
@@ -110,5 +115,6 @@ def feature_columns(df: pd.DataFrame, target: str = "flood_risk") -> list[str]:
     How: take every numeric column and remove NON_FEATURE_COLUMNS plus the target, so a new
     feature added in `build_timeseries_features` is picked up automatically.
     """
-    excluded = NON_FEATURE_COLUMNS | {target}
+    excluded = NON_FEATURE_COLUMNS | {target}   # set union: ids + label source + the label itself
+    # Keep numeric columns (ints/floats) in their table order, skipping the excluded ones
     return [c for c in df.select_dtypes(include=[np.number]).columns if c not in excluded]

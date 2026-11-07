@@ -1,6 +1,6 @@
 """Models, CV, evaluation tables and best-model selection."""
-import numpy as np
-import pandas as pd
+import numpy as np    # numeric assertions
+import pandas as pd   # small hand-made input tables
 
 from src.benchmark import (
     SCORING, cross_validate_models, evaluate_on_test, evaluate_per_location, select_best_model,
@@ -12,9 +12,9 @@ from src.preprocessing import build_preprocessor, time_series_cv_splits
 
 def test_persistence_baseline_rule():
     """Persistence predicts flood only when today's relative discharge is strictly above 1."""
-    X = pd.DataFrame({"q_t_rel": [0.5, 1.0, 1.5]})
+    X = pd.DataFrame({"q_t_rel": [0.5, 1.0, 1.5]})   # below, exactly at, and above the threshold
     m = PersistenceBaseline().fit(X, [0, 1, 1])
-    assert m.predict(X).tolist() == [0, 0, 1]
+    assert m.predict(X).tolist() == [0, 0, 1]         # 1.0 is NOT above 1 -> no flood
     np.testing.assert_allclose(m.predict_proba(X).sum(axis=1), 1)   # valid probability rows
 
 
@@ -50,8 +50,10 @@ def test_full_benchmark_on_synthetic(labelled_split):
 
 def test_select_best_model_ignores_baselines_and_uses_cv():
     """Even if a baseline has the top score, the best ML model is selected."""
+    # Fake CV table where the baseline has the highest score
     cv = pd.DataFrame({
         "model": ["PersistenceBaseline", "RandomForest", "LogisticRegression"],
         "average_precision": [0.99, 0.70, 0.80],
     })
+    # The baseline is skipped; the best ML model (0.80) wins
     assert select_best_model(cv, "average_precision") == "LogisticRegression"
